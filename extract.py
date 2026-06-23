@@ -242,18 +242,39 @@ def _strip_subject(text: str) -> str:
     return re.sub(r"(?im)^subject:.*$", "", text)
 
 
+def _delivery_sentence(text_n: str) -> str | None:
+    """Return the sentence containing the count+unit ('… 30 colis …'), so that
+    unit/goods are read from the delivery clause and not from the random
+    distractor sentence (which may mention e.g. 'frozen lake' or 'a palette of
+    colours')."""
+    unit_alt = "|".join(PARCEL_WORDS + PALLET_WORDS)
+    parts = re.split(r"[.!?\n]", text_n)
+    # prefer a sentence with both a digit and a unit word
+    for s in parts:
+        if re.search(rf"\d+\s+(?:{unit_alt})|(?:{unit_alt})\s+\d+", s):
+            return s
+    # else any sentence mentioning a unit word
+    for s in parts:
+        if re.search(rf"\b(?:{unit_alt})\b", s):
+            return s
+    return None
+
+
 def parse_text(text: str) -> Signals:
     """Extract all signals from a single text blob (email body or transcript)."""
     if not text:
         return Signals()
     text_n = _norm(text)
     body_n = _norm(_strip_subject(text))   # count comes from the body, not subject
+    # Scope unit/goods to the delivery sentence to avoid distractor-noise keywords;
+    # fall back to the whole text when no clear delivery sentence is found.
+    scope_n = _delivery_sentence(body_n) or text_n
     sig = Signals(
         supplier_name=_find_supplier(text),
         parcel_count=_find_count(body_n),
-        unit=_find_unit(text_n),
-        goods_type=_find_goods(text_n),
-        has_damage=_find_damage(text_n),
+        unit=_find_unit(scope_n),
+        goods_type=_find_goods(scope_n),
+        has_damage=_find_damage(text_n),   # damage alert can be its own sentence
     )
     log.debug("parse_text → %s", sig)
     return sig

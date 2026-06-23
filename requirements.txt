@@ -1,3 +1,8 @@
 websockets
 faster-whisper
 rapidfuzz
+jellyfish      # phonetic (metaphone) supplier matching
+numpy          # blended fuzzy+phonetic scoring
+# Local LLM/vision via ollama (HTTP API, no python dep). Pull models with:
+#   ollama pull llama3.1   &&   ollama pull llava:7b
+# Override models via env: LLM_MODEL, VISION_MODEL, WHISPER_MODEL (see config.py)
