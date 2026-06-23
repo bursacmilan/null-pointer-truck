@@ -48,8 +48,12 @@ class SmartStrategy(Strategy):
                 photo_damage = self._damage_from_photo(doc.get("url", ""))
             elif dtype == "audio":
                 try:
-                    transcript = audio.transcribe_url(doc["url"])
-                    audio_sig = parse_text(transcript)
+                    # Candidates are ordered raw-first (best supplier-name fidelity),
+                    # then english translation (best unit/goods vocabulary). Merging
+                    # keeps the raw fields and lets later candidates fill the gaps.
+                    audio_sig = Signals()
+                    for cand in audio.transcribe_candidates(doc["url"]):
+                        audio_sig = merge_signals(audio_sig, parse_text(cand))
                 except Exception:
                     log.exception("Audio transcription failed for %s", doc.get("url"))
 

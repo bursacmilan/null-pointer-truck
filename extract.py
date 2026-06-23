@@ -32,6 +32,7 @@ PARCEL_WORDS = [
     "colis", "paquet", "paquets", "paquete", "paquetes",
     "parcel", "parcels", "package", "packages",
     "paket", "pakete", "pacco", "pacchi", "collo", "colli",
+    "colete", "colete", "colet", "pacote", "pacotes",   # ro/pt (translate/misdetect)
 ]
 PALLET_WORDS = [
     "palette", "palettes", "pallet", "pallets",
@@ -43,11 +44,14 @@ PERISHABLE_WORDS = [
     "perecedero", "perecederos", "perecedera",
     "deperibile", "deperibili", "verderblich", "kuhlware", "kuehlware",
     "frisch", "refrigere", "refrigerated", "frozen", "surgele",
+    "chilled", "cold chain", "cold-chain",         # english-translation variants
 ]
 OVERSIZED_WORDS = [
     "encombrant", "encombrants", "oversized", "oversize",
     "sperrig", "sperrgut", "ubergross", "uebergross", "ingombrante",
     "ingombranti", "voluminoso", "voluminosa", "voluminous", "bulky",
+    "over-dimensional", "over dimensional", "overdimensional",  # translate variants
+    "oversized goods", "dimensional",
 ]
 # Damage is signalled by a dedicated ALERT line, e.g.
 #   "Alert: major cargo damage detected!" / "Kritisch! Erhebliche Transportschäden…"
