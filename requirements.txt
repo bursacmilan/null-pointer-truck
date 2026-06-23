@@ -1,5 +1,6 @@
 websockets
 faster-whisper
 rapidfuzz
+jellyfish
 google-genai
 requests

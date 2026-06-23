@@ -21,7 +21,7 @@ for _p in (_ROOT, _HERE):
         sys.path.insert(0, _p)
 
 # ── Override team identity BEFORE importing main (which copies these at import time) ──
-TEAM_ID = "nulltruckpoint-ak"
+TEAM_ID = os.environ.get("TEAM_ID", "nulltruckpoint-ak")
 WS_URL  = f"wss://truckgenerator-production.up.railway.app/ws?team_id={TEAM_ID}"
 
 import config
