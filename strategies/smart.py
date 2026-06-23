@@ -35,15 +35,21 @@ class SmartStrategy(Strategy):
             return True
         return None
 
-    def _gather(self, truck: dict) -> tuple[Signals, bool | None]:
+    def _gather(self, truck: dict) -> tuple[Signals, bool | None, list[str]]:
         email_sig: Signals | None = None
         audio_sig: Signals | None = None
         photo_damage: bool | None = None
+        supplier_candidates: list[str] = []   # all transcript-derived name guesses
+
+        def add_name(sig: Signals):
+            if sig.supplier_name:
+                supplier_candidates.append(sig.supplier_name)
 
         for doc in truck.get("documentation", []):
             dtype = doc.get("type")
             if dtype == "email":
                 email_sig = parse_text(doc.get("text", ""))
+                add_name(email_sig)
             elif dtype == "photo":
                 photo_damage = self._damage_from_photo(doc.get("url", ""))
             elif dtype == "audio":
@@ -53,13 +59,29 @@ class SmartStrategy(Strategy):
                     # keeps the raw fields and lets later candidates fill the gaps.
                     audio_sig = Signals()
                     for cand in audio.transcribe_candidates(doc["url"]):
-                        audio_sig = merge_signals(audio_sig, parse_text(cand))
+                        cand_sig = parse_text(cand)
+                        add_name(cand_sig)            # keep every name variant
+                        audio_sig = merge_signals(audio_sig, cand_sig)
                 except Exception:
                     log.exception("Audio transcription failed for %s", doc.get("url"))
 
         # email text fields take priority; audio fills gaps
         merged = merge_signals(email_sig or Signals(), audio_sig)
-        return merged, photo_damage
+        return merged, photo_damage, supplier_candidates
+
+    def _best_supplier(self, candidates: list[str]) -> tuple[int, str, float]:
+        """Match every candidate name and return the highest-confidence supplier.
+        A translation often anglicises a garbled name closer to canonical
+        (e.g. 'Edward Blythe-Scheinz' raw vs 'Edwards Lifesciences' translated)."""
+        best = None
+        for name in candidates:
+            sid, sname, score = self.suppliers.match(name)
+            if best is None or score > best[2]:
+                best = (sid, sname, score)
+        if best is None:
+            sid, sname, score = self.suppliers.match("")
+            return sid, sname, 0.0
+        return best
 
     # ── routing ───────────────────────────────────────────────────────────────
 
@@ -98,7 +120,7 @@ class SmartStrategy(Strategy):
     # ── main entry point ────────────────────────────────────────────────────────
 
     def decide(self, truck: dict) -> Decision:
-        sig, photo_damage = self._gather(truck)
+        sig, photo_damage, supplier_candidates = self._gather(truck)
 
         # damage: photo is authoritative; else text signal; else assume no damage
         if photo_damage is not None:
@@ -108,10 +130,10 @@ class SmartStrategy(Strategy):
         else:
             has_damage = False
 
-        # supplier resolution
-        sid, sname, score = self.suppliers.match(sig.supplier_name or "")
-        log.info("Supplier '%s' → #%s '%s' (score %.0f)",
-                 sig.supplier_name, sid, sname, score)
+        # supplier resolution — best match across all transcript-derived names
+        sid, sname, score = self._best_supplier(supplier_candidates)
+        log.info("Supplier candidates %s → #%s '%s' (score %.0f)",
+                 supplier_candidates, sid, sname, score)
 
         unit  = sig.unit or "parcels"
         count = sig.parcel_count if sig.parcel_count is not None else 0
