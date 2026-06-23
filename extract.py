@@ -110,6 +110,8 @@ _UNITS = {
 }
 
 # Phrases that introduce the supplier name (regex, accent-insensitive, no-accent text).
+# Ordered: specific company-keyword intros first (incl. possessive "company's X"),
+# then generic "this is / we are / I am" fallbacks for translated audio.
 _SUPPLIER_PATTERNS = [
     r"de la part de\s+(.+?)(?:,|\.|nous|veuillez|$)",
     r"on behalf of\s+(.+?)(?:,|\.|please|$)",
@@ -117,12 +119,20 @@ _SUPPLIER_PATTERNS = [
     r"vi comunichiamo che\s+(.+?)(?:,|\.|consegnera|$)",
     r"informieren sie uber den heutigen eingang von\s+(.+?)(?:,|\.|:|$)",
     r"l'?arrivee prevue de\s+(.+?)(?:,|\.|avec|$)",
-    r"empresa\s+(.+?)(?:,|\.|entregamos|$)",
-    r"company\s+(.+?)(?:,|\.|we|$)",
-    r"firma\s+(.+?)(?:,|\.|wir|$)",
-    r"societe\s+(.+?)(?:,|\.|$)",
-    r"azienda\s+(.+?)(?:,|\.|$)",
+    # company-keyword + optional possessive 's  (handles "company's ATI")
+    r"(?:empresa|company|firma|societe|azienda|ditta|impresa)(?:'?s)?\s+(.+?)"
+    r"(?:,|\.|entregamos|we |wir |is |plant|$)",
+    # generic self-introductions in translated/English audio
+    r"(?:calling from|this is|we are|i am|here is|hier spricht|somos)\s+"
+    r"(?:the\s+)?(?:company\s+|empresa\s+|firma\s+)?(.+?)(?:,|\.|we |$)",
 ]
+
+# Words to trim off the head/tail of an extracted supplier name.
+_NAME_STRIP = re.compile(
+    r"^(the|la|le|el|il|der|die|das)\s+|"
+    r"\s+(plant|company|incoming|today|incoming today|delivering)\s*$",
+    re.IGNORECASE,
+)
 
 
 def _deaccent(s: str) -> str:
@@ -219,7 +229,10 @@ def _find_supplier(text_raw: str) -> str | None:
         if m:
             # Map the normalized span back to the raw text for original casing.
             start, end = m.span(1)
-            return text_raw[start:end].strip(" .,:;")
+            cand = text_raw[start:end].strip(" .,:;'")
+            cand = _NAME_STRIP.sub("", cand).strip(" .,:;'")
+            if cand:
+                return cand
     return None
 
 
