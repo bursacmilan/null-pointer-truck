@@ -126,37 +126,41 @@ class SmartStrategy(Strategy):
 
     # ── routing ───────────────────────────────────────────────────────────────
 
-    def _category_ramps(self, sig: Signals) -> list[str]:
+    def _category_ramps(self, sig: Signals) -> tuple[list[str], list[str]]:
+        """Return (primary, secondary) valid ramps. Secondary ramps still earn
+        the category bonus (e.g. standard pallets ≤32 are valid in R03–R07, since
+        R05/R06/R07 also accept normal pallets) but let us grab a free lane (+7)
+        when the primaries are all occupied."""
         goods = sig.goods_type or "standard"
         unit  = sig.unit or "parcels"
         count = sig.parcel_count or 0
 
         if goods == "perishable":
-            return ["R07"]                       # mandatory
+            return ["R07"], []                          # mandatory cold chain
         if goods == "oversized":
-            return ["R05", "R06"]
-        # standard
-        if unit == "pallets":
-            if count > 32:
-                return ["R08"]
-            return ["R03", "R04"]
-        # parcels, standard
-        return ["R01", "R02"]
+            return ["R05", "R06"], []                   # heavy lanes
+        if unit == "pallets" and count > 32:
+            return ["R08"], []                          # double-truck lane
+        if unit == "pallets":                           # standard pallets ≤32
+            return ["R03", "R04"], ["R05", "R06", "R07"]
+        return ["R01", "R02"], []                        # parcels, standard
 
-    def _choose_ramp(self, candidates: list[str], ramp_status: list[dict]) -> str:
+    def _choose_ramp(self, primary: list[str], secondary: list[str],
+                     ramp_status: list[dict]) -> str:
         status = {r["ramp"]: r for r in ramp_status}
 
-        def is_free(ramp: str) -> bool:
-            return status.get(ramp, {}).get("status") == "free"
+        def free_sorted(cands: list[str]) -> list[str]:
+            return sorted([c for c in cands if status.get(c, {}).get("status") == "free"],
+                          key=lambda c: status.get(c, {}).get("queue_length", 99))
 
-        def queue(ramp: str) -> int:
-            return status.get(ramp, {}).get("queue_length", 0)
-
-        free = [r for r in candidates if is_free(r)]
-        if free:
-            return min(free, key=queue)
-        # no free ramp in category → shortest queue in category (keeps +5 category)
-        return min(candidates, key=queue)
+        # free primary (+7 +5) > free secondary (+7 +5) > shortest-queue primary (+5)
+        free_p = free_sorted(primary)
+        if free_p:
+            return free_p[0]
+        free_s = free_sorted(secondary)
+        if free_s:
+            return free_s[0]
+        return min(primary, key=lambda c: status.get(c, {}).get("queue_length", 99))
 
     # ── main entry point ────────────────────────────────────────────────────────
 
@@ -188,10 +192,10 @@ class SmartStrategy(Strategy):
                 parcel_count=count, has_damage=True, unit=unit,
             )
 
-        candidates = self._category_ramps(sig)
-        ramp = self._choose_ramp(candidates, truck.get("ramp_status", []))
-        log.info("Routing goods=%s unit=%s count=%s → candidates=%s → %s",
-                 sig.goods_type, unit, count, candidates, ramp)
+        primary, secondary = self._category_ramps(sig)
+        ramp = self._choose_ramp(primary, secondary, truck.get("ramp_status", []))
+        log.info("Routing goods=%s unit=%s count=%s → primary=%s secondary=%s → %s",
+                 sig.goods_type, unit, count, primary, secondary, ramp)
 
         return Decision(
             endpoint="assign-ramp",
