@@ -60,3 +60,6 @@ nunit-*.xml
 .venv/
 __pycache__/
 *.pyc
+
+# Throwaway capture/eval artifacts
+samples/

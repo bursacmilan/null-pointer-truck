@@ -58,12 +58,31 @@ def build_payload(truck_id: str, d: Decision) -> dict:
 # ── Agent loop ────────────────────────────────────────────────────────────────
 
 async def run(strategy: Strategy) -> None:
-    log.info("Connecting to %s", WS_URL)
+    """Connect and process trucks, auto-reconnecting on transient disconnects."""
+    backoff = 2
+    while True:
+        try:
+            log.info("Connecting to %s", WS_URL)
+            async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=60) as ws:
+                log.info("WebSocket connected. Team: %s  Strategy: %s",
+                         TEAM_ID, type(strategy).__name__)
+                backoff = 2  # reset after a successful connect
+                await _consume(ws, strategy)
+            log.info("Stream ended cleanly; reconnecting in %ds...", backoff)
+        except websockets.exceptions.ConnectionClosedError as e:
+            if "same team name" in str(e):
+                log.warning("Another '%s' client is connected. Retrying in %ds "
+                            "(stop the other client to take over).", TEAM_ID, backoff)
+            else:
+                log.warning("Connection closed (%s); reconnecting in %ds...", e, backoff)
+        except Exception:
+            log.exception("Unexpected error; reconnecting in %ds...", backoff)
 
-    async with websockets.connect(WS_URL) as ws:
-        log.info("WebSocket connected. Team: %s  Strategy: %s",
-                 TEAM_ID, type(strategy).__name__)
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, 30)
 
+
+async def _consume(ws, strategy: Strategy) -> None:
         async for raw in ws:
             log.debug("Raw WS message: %s", raw[:300])
 
@@ -82,7 +101,9 @@ async def run(strategy: Strategy) -> None:
             log.debug("Ramp status: %s", ramps)
 
             try:
-                decision = strategy.decide(truck)
+                # Run in a thread so blocking work (whisper STT, HTTP) doesn't
+                # stall the websocket heartbeat.
+                decision = await asyncio.to_thread(strategy.decide, truck)
                 log.info("Decision → endpoint=%s  supplier_id=%s  parcel_count=%s  "
                          "has_damage=%s  unit=%s  ramp=%s",
                          decision.endpoint, decision.supplier_id, decision.parcel_count,
@@ -91,16 +112,19 @@ async def run(strategy: Strategy) -> None:
                 log.exception("Strategy raised an exception for truck %s — skipping", truck_id)
                 continue
 
-            payload  = build_payload(truck_id, decision)
-            response = post_json(decision.endpoint, payload)
+            payload   = build_payload(truck_id, decision)
+            response  = await asyncio.to_thread(post_json, decision.endpoint, payload)
 
             total = response.get("total", "?")
-            log.info("Score for %s: total=%s  extraction=%s  decision=%s  throughput=%s",
-                     truck_id,
-                     total,
+            run.cumulative += total if isinstance(total, (int, float)) else 0
+            run.processed += 1
+            log.info("Score for %s: total=%s  (extraction=%s decision=%s throughput=%s)  "
+                     "| running=%s over %d trucks",
+                     truck_id, total,
                      response.get("extraction_score"),
                      response.get("decision_score"),
-                     response.get("throughput_bonus"))
+                     response.get("throughput_bonus"),
+                     run.cumulative, run.processed)
 
             breakdown = response.get("breakdown", {})
             for field, info in breakdown.items():
@@ -110,13 +134,28 @@ async def run(strategy: Strategy) -> None:
                 log.debug("  %-14s %s/%s  %s", field, earned, maxi, result)
 
 
+run.cumulative = 0
+run.processed = 0
+
+
 def main() -> None:
-    strategy = DummyRejectStrategy()
+    from suppliers import load_index
+    from strategies import SmartStrategy
+    import audio
+
+    log.info("Loading supplier index...")
+    index = load_index()
+
+    log.info("Warming up whisper model...")
+    audio.warm_up()
+
+    strategy = SmartStrategy(index)
     log.info("Starting agent with strategy: %s", type(strategy).__name__)
     try:
         asyncio.run(run(strategy))
     except KeyboardInterrupt:
-        log.info("Interrupted by user.")
+        log.info("Interrupted by user. Final: %s points over %d trucks",
+                 run.cumulative, run.processed)
 
 
 if __name__ == "__main__":
