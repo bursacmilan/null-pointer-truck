@@ -2,15 +2,15 @@
 """
 GeminiRampStrategy — Gemini 2.5 Flash via company Vertex AI.
 
-Supplier resolution is done locally with fuzzy matching so we never need
-to send 9169 supplier names to the LLM. Gemini just extracts the raw name
-it hears/sees; we match it against the full list with difflib.
+Supplier resolution: Gemini extracts the raw name it hears/sees; we fuzzy-match
+locally against all 9169 suppliers using normalized names + SequenceMatcher.
 """
 
 import difflib
 import json
 import logging
 import os
+import re
 import sys
 
 import requests
@@ -32,21 +32,35 @@ GCP_PROJECT  = os.environ.get("GCP_PROJECT", "dg-ml-dev")
 GCP_LOCATION = "europe-west1"
 MODEL        = "gemini-2.5-flash"
 
+# Company suffixes stripped before fuzzy matching
+_SUFFIX_RE = re.compile(
+    r"\b(inc|corp|co|llc|ltd|gmbh|ag|sa|bv|nv|plc|kg|kgaa|oy|ab|as|srl|spa|sas|se"
+    r"|group|holding|holdings|international|global|fund|financial|capital)\b\.?",
+    re.IGNORECASE,
+)
+
 SYSTEM_PROMPT = """\
 You are a warehouse logistics agent. Analyze the provided truck documentation \
 (photo, supplier email, and optionally a driver audio note) and extract delivery \
 information as JSON.
 
 Rules:
-- raw_supplier_name: copy the supplier name EXACTLY as mentioned in the documentation \
-  (email sender/signature, spoken in audio). Do not paraphrase or abbreviate.
-- has_damage: true if ANY source (visual damage in photo, text mentions damage, \
-  audio mentions damage). Be conservative — when in doubt, mark as damaged.
-- goods_type: "perishable" = food, medicine, refrigerated, cold chain; \
-  "oversized" = heavy machinery, bulk freight, exceptionally large items; \
-  "standard" = everything else.
-- unit: "parcels" if individual packages/boxes are counted; "pallets" if pallets/Paletten.
-- parcel_count: the integer quantity stated in the documentation.
+- raw_supplier_name: the supplier name EXACTLY as mentioned (email sender/signature, \
+  spoken in audio). Copy verbatim — do NOT paraphrase or look up alternatives.
+- has_damage: true if ANY signal indicates damage: visible dents/cracks in photo, \
+  text words like "beschädigt / damaged / endommagé / danneggiato / defekt", \
+  or audio mentions damage. Be conservative — doubt → true.
+- goods_type:
+    "perishable" = food, beverages, medicine, fresh produce, dairy, frozen goods, \
+    cold chain, refrigerated. Keywords: Kühlware, frisch, gefroren, Lebensmittel, \
+    alimentaire, frigo, surgelé, deperibile, farmaci.
+    "oversized" = heavy machinery, vehicles, construction equipment, bulk raw materials, \
+    exceptionally large/heavy freight. Keywords: Schwergut, sperrig, Übermaß, \
+    encombrante, ingombrante, vrac.
+    "standard" = everything else (electronics, textiles, auto parts, general goods).
+- unit: "parcels" = individual boxes/packages/Pakete/colis/colli counted as pieces. \
+  "pallets" = Paletten/palettes/pallet loads.
+- parcel_count: the integer quantity stated. Extract exactly — do not estimate.
 """
 
 RESPONSE_SCHEMA = {
@@ -55,7 +69,7 @@ RESPONSE_SCHEMA = {
     "properties": {
         "raw_supplier_name": {
             "type": "STRING",
-            "description": "Supplier name exactly as it appears in the documentation",
+            "description": "Supplier name verbatim from the documentation",
         },
         "parcel_count": {"type": "INTEGER"},
         "unit":         {"type": "STRING", "enum": ["parcels", "pallets"]},
@@ -66,6 +80,13 @@ RESPONSE_SCHEMA = {
 }
 
 
+def _normalize(name: str) -> str:
+    """Lowercase, strip company suffixes and punctuation for fuzzy matching."""
+    name = _SUFFIX_RE.sub(" ", name)
+    name = re.sub(r"[^\w\s]", " ", name)
+    return " ".join(name.lower().split())
+
+
 class ClaudeRampStrategy(Strategy):
 
     def __init__(self) -> None:
@@ -73,11 +94,11 @@ class ClaudeRampStrategy(Strategy):
             vertexai=True,
             project=GCP_PROJECT,
             location=GCP_LOCATION,
-            http_options=HttpOptions(timeout=60000),  # milliseconds
+            http_options=HttpOptions(timeout=60000),
         )
-        self._suppliers     = self._fetch_suppliers()
-        self._supplier_names = [s["supplier_name"] for s in self._suppliers]
-        self._name_to_sup   = {s["supplier_name"]: s for s in self._suppliers}
+        self._suppliers = self._fetch_suppliers()
+        # Pre-compute normalized names for fast matching
+        self._norm_names = [_normalize(s["supplier_name"]) for s in self._suppliers]
         log.info("GeminiRampStrategy ready — model=%s  suppliers=%d",
                  MODEL, len(self._suppliers))
 
@@ -87,30 +108,42 @@ class ClaudeRampStrategy(Strategy):
         return resp.json()
 
     def _resolve_supplier(self, raw_name: str) -> tuple[int, str]:
-        """Fuzzy-match raw_name against full supplier list locally."""
-        matches = difflib.get_close_matches(
-            raw_name, self._supplier_names, n=1, cutoff=0.3
-        )
-        if matches:
-            sup = self._name_to_sup[matches[0]]
-            log.debug("Supplier match: '%s' → '%s' (%d)", raw_name, sup["supplier_name"], sup["supplier_id"])
-            return sup["supplier_id"], sup["supplier_name"]
+        """Best-effort fuzzy match: normalized ratio → token overlap → first match."""
+        norm_raw = _normalize(raw_name)
 
-        # Fallback: token-based partial match
-        raw_tokens = set(raw_name.lower().split())
-        best, best_score = None, 0
-        for name, sup in self._name_to_sup.items():
-            tokens = set(name.lower().split())
-            score = len(raw_tokens & tokens)
-            if score > best_score:
-                best, best_score = sup, score
+        # Strategy 1: SequenceMatcher ratio on normalized full names
+        best_idx, best_ratio = 0, 0.0
+        for i, norm in enumerate(self._norm_names):
+            r = difflib.SequenceMatcher(None, norm_raw, norm, autojunk=False).ratio()
+            if r > best_ratio:
+                best_ratio, best_idx = r, i
 
-        if best and best_score > 0:
-            log.debug("Supplier token-match: '%s' → '%s' (%d)", raw_name, best["supplier_name"], best["supplier_id"])
-            return best["supplier_id"], best["supplier_name"]
+        # Strategy 2: token overlap on normalized names (helps with partial matches)
+        raw_tokens = set(norm_raw.split())
+        best_tok_idx, best_tok_score = 0, 0
+        if raw_tokens:
+            for i, norm in enumerate(self._norm_names):
+                score = len(raw_tokens & set(norm.split()))
+                if score > best_tok_score:
+                    best_tok_score, best_tok_idx = score, i
 
-        log.warning("No supplier match for '%s' — using placeholder", raw_name)
-        return self._suppliers[0]["supplier_id"], self._suppliers[0]["supplier_name"]
+        # Pick best: prefer ratio match, fall back to token if ratio is weak
+        if best_ratio >= 0.5:
+            idx = best_idx
+            log.debug("Supplier ratio-match (%.2f): '%s' → '%s'",
+                      best_ratio, raw_name, self._suppliers[idx]["supplier_name"])
+        elif best_tok_score >= 2:
+            idx = best_tok_idx
+            log.debug("Supplier token-match (%d tokens): '%s' → '%s'",
+                      best_tok_score, raw_name, self._suppliers[idx]["supplier_name"])
+        else:
+            idx = best_idx
+            log.warning("Low-confidence supplier match (ratio=%.2f tok=%d): '%s' → '%s'",
+                        best_ratio, best_tok_score, raw_name,
+                        self._suppliers[idx]["supplier_name"])
+
+        sup = self._suppliers[idx]
+        return sup["supplier_id"], sup["supplier_name"]
 
     def decide(self, truck: dict) -> Decision:
         docs      = truck.get("documentation", [])
@@ -121,7 +154,7 @@ class ClaudeRampStrategy(Strategy):
 
         supplier_id, supplier_name = self._resolve_supplier(data["raw_supplier_name"])
 
-        log.info("Extracted: raw_name='%s' → supplier_id=%s  count=%s  unit=%s  damage=%s  goods=%s",
+        log.info("raw='%s' → id=%s  count=%s  unit=%s  damage=%s  goods=%s",
                  data["raw_supplier_name"], supplier_id,
                  data["parcel_count"], data["unit"],
                  data["has_damage"], data["goods_type"])
@@ -156,10 +189,8 @@ class ClaudeRampStrategy(Strategy):
 
     def _build_parts(self, docs: list[dict]) -> list:
         parts = []
-
         for doc in docs:
             dtype = doc.get("type", "")
-
             if dtype in ("photo", "image"):
                 try:
                     img_bytes = requests.get(self._abs_url(doc["url"]), timeout=15).content
@@ -169,12 +200,10 @@ class ClaudeRampStrategy(Strategy):
                     log.debug("Image added (%d bytes)", len(img_bytes))
                 except Exception as exc:
                     log.warning("Could not download image %s: %s", doc.get("url"), exc)
-
             elif dtype == "email":
                 text = doc.get("text", doc.get("body", ""))
                 if text:
                     parts.append(types.Part(text=f"[EMAIL]\n{text}"))
-
             elif dtype == "audio":
                 try:
                     audio_bytes = requests.get(self._abs_url(doc["url"]), timeout=15).content
@@ -222,12 +251,14 @@ class ClaudeRampStrategy(Strategy):
         if goods_type == "perishable":
             groups = [["R07"], ["R01", "R02"], ["R03", "R04", "R05", "R06", "R08"]]
         elif unit == "parcels":
+            # parcels that are perishable must go R07 — but goods_type already covers that
             groups = [["R01", "R02"], ["R03", "R04", "R05", "R06", "R07", "R08"]]
         elif unit == "pallets" and count > 32:
             groups = [["R08"], ["R05", "R06"], ["R03", "R04"]]
         elif goods_type == "oversized":
             groups = [["R05", "R06"], ["R03", "R04"], ["R07", "R08"]]
         else:
+            # standard pallets ≤ 32
             groups = [["R03", "R04"], ["R05", "R06"], ["R07", "R08"]]
 
         for group in groups:
