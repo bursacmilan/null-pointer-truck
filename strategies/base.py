@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
@@ -20,5 +22,5 @@ class Strategy(ABC):
     """
 
     @abstractmethod
-    def decide(self, truck: dict) -> Decision:
+    async def decide(self, truck: dict) -> Decision:
         ...

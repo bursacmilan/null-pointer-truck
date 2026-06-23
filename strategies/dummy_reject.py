@@ -11,7 +11,7 @@ class DummyRejectStrategy(Strategy):
     Used to verify end-to-end WebSocket and POST plumbing before real logic.
     """
 
-    def decide(self, truck: dict) -> Decision:
+    async def decide(self, truck: dict) -> Decision:
         log.debug("DummyRejectStrategy: rejecting truck unconditionally")
         return Decision(
             endpoint      = "reject-truck",

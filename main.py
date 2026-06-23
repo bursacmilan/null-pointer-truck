@@ -6,20 +6,26 @@ RampRush agent — WebSocket plumbing + pluggable strategy.
 import asyncio
 import json
 import logging
+import os
 import urllib.request
 
 import websockets
 
 from config import API_BASE, TEAM_ID, WS_URL
-from strategies import DummyRejectStrategy, Strategy
+from strategies import DummyRejectStrategy, LLMStrategy, Strategy
 from strategies.base import Decision
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
     datefmt="%H:%M:%S",
 )
+# Silence the noisy HTTP / SDK logs — they otherwise dump base64 image payloads.
+for noisy in ("httpx", "httpcore", "anthropic", "anthropic._base_client",
+              "urllib3", "websockets.client", "websockets.protocol", "asyncio"):
+    logging.getLogger(noisy).setLevel(logging.WARNING)
+
 log = logging.getLogger("agent")
 
 
@@ -82,7 +88,7 @@ async def run(strategy: Strategy) -> None:
             log.debug("Ramp status: %s", ramps)
 
             try:
-                decision = strategy.decide(truck)
+                decision = await strategy.decide(truck)
                 log.info("Decision → endpoint=%s  supplier_id=%s  parcel_count=%s  "
                          "has_damage=%s  unit=%s  ramp=%s",
                          decision.endpoint, decision.supplier_id, decision.parcel_count,
@@ -110,11 +116,19 @@ async def run(strategy: Strategy) -> None:
                 log.debug("  %-14s %s/%s  %s", field, earned, maxi, result)
 
 
-def main() -> None:
-    strategy = DummyRejectStrategy()
+async def _main_async() -> None:
+    strategy: Strategy
+    if os.environ.get("STRATEGY", "llm").lower() == "dummy":
+        strategy = DummyRejectStrategy()
+    else:
+        strategy = await LLMStrategy.bootstrap()
     log.info("Starting agent with strategy: %s", type(strategy).__name__)
+    await run(strategy)
+
+
+def main() -> None:
     try:
-        asyncio.run(run(strategy))
+        asyncio.run(_main_async())
     except KeyboardInterrupt:
         log.info("Interrupted by user.")
 
