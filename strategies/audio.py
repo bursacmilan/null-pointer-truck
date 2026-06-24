@@ -58,10 +58,12 @@ class WhisperTranscriber:
         path_for_whisper = cleaned_path or raw_path
 
         try:
+            # Empty string triggers whisper.cpp's language auto-detection;
+            # passing "auto" is invalid and prints "unknown language 'auto'".
             segments = await asyncio.to_thread(
                 self._model.transcribe,
                 path_for_whisper,
-                language="auto",
+                language="",
             )
             text = " ".join(s.text for s in segments).strip()
             log.debug("Transcript: %s", text)
